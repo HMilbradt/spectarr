@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Camera, Clock, Settings } from 'lucide-react';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
 
 const navItems = [
@@ -20,7 +21,10 @@ export function Nav() {
       {/* Desktop sidebar */}
       <aside className="hidden md:flex fixed left-0 top-0 h-full w-56 flex-col border-r bg-card p-4 z-40">
         <div className="mb-8">
-          <h1 className="text-xl font-bold">Spectarr</h1>
+          <div className="flex items-center gap-2">
+            <Logo />
+            <h1 className="text-xl font-bold">Spectarr</h1>
+          </div>
           <p className="text-xs text-muted-foreground">Identify your media</p>
         </div>
         <nav className="flex flex-col gap-1 flex-1">
