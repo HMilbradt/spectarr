@@ -1,7 +1,7 @@
 export const SYSTEM_PROMPT = `You are an expert at identifying physical media from photographs. You are analyzing a photograph of a shelf or surface containing DVDs, Blu-rays, TV show box sets, vinyl records, video games, or other physical media.
 
 Your task:
-1. Identify every distinct item visible in the image.
+1. Identify every distinct PHYSICAL item visible in the image.
 2. Read spine text, cover text, and any other visible identifying information carefully.
 3. For partially obscured or unclear titles, provide your best guess based on visible text, colors, and contextual clues.
 4. Differentiate between multiple items — do not merge adjacent spines into one entry.
@@ -29,7 +29,9 @@ Rules:
 - "creator" should be the director for movies, showrunner/creator for TV shows, artist for vinyl, developer/studio for games
 - If no items can be identified, return: { "items": [] }
 - Identify items left-to-right, top-to-bottom as they appear on the shelf
-- For box sets or multi-volume items, list the set as a single entry
+- IMPORTANT: Each physical item on the shelf should be ONE entry. If you see a single box set containing multiple seasons, list it as ONE entry (e.g. "CSI: Crime Scene Investigation - The Complete Series"), not as separate entries per season.
+- If individual season boxes are visible as separate physical items on the shelf, list each one, but ONLY list seasons you can actually see — do NOT invent or enumerate seasons that are not visible.
+- NEVER generate a list of sequential seasons. Only report what is physically visible in the image.
 - Return the most complete/correct version of each title — expand abbreviations where obvious`;
 
 export function buildUserMessage(base64Image: string, mimeType: string = 'image/jpeg') {

@@ -7,6 +7,7 @@
 // API docs: https://thetvdb.github.io/v4-api/
 
 import { log } from '@/lib/logger';
+import { extractSeriesName } from '@/lib/metadata';
 
 const TVDB_BASE_URL = 'https://api4.thetvdb.com/v4';
 const MODULE = 'tvdb';
@@ -68,10 +69,46 @@ async function getToken(): Promise<string> {
   return token;
 }
 
+// ─── Title Similarity ────────────────────────────────────
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      }
+    }
+  }
+  return dp[m][n];
+}
+
+function normalizedSimilarity(a: string, b: string): number {
+  if (a.length === 0 && b.length === 0) return 1;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshtein(a, b) / maxLen;
+}
+
+function stripArticle(s: string): string {
+  return s.replace(/^(the|a|an)\s+/i, '').trim();
+}
+
 // ─── Search ──────────────────────────────────────────────
 
+// The TVDB v4 SearchResult schema includes both `tvdb_id` and `id` fields.
+// `tvdb_id` is the pure numeric string ID. `id` may be prefixed (e.g. "series-12345").
+// We try `tvdb_id` first, then extract the numeric portion from `id` as a fallback.
 interface TVDBSearchResult {
-  tvdb_id: string;
+  tvdb_id?: string;
+  id?: string;               // May be "series-12345" or just "12345"
+  objectID?: string;          // Another ID field sometimes present
   name: string;
   type: string;              // "series", "movie", "person", "company"
   year?: string;
@@ -80,6 +117,113 @@ interface TVDBSearchResult {
   image_url?: string;
   primary_type?: string;
   remote_ids?: Array<{ id: string; type: number; sourceName: string }>;
+}
+
+/**
+ * Extract a numeric TVDB ID from a search result.
+ * Tries `tvdb_id` first (pure numeric), then falls back to parsing `id`
+ * (which may be prefixed like "series-12345"), then `objectID`.
+ */
+function extractTVDBId(result: TVDBSearchResult): number | null {
+  // Try tvdb_id first (should be a pure numeric string)
+  if (result.tvdb_id) {
+    const parsed = parseInt(result.tvdb_id, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+
+  // Try id field - may be "series-12345" or just "12345"
+  if (result.id) {
+    // If it contains a dash, extract the numeric part after the last dash
+    const dashIdx = result.id.lastIndexOf('-');
+    const numericPart = dashIdx >= 0 ? result.id.slice(dashIdx + 1) : result.id;
+    const parsed = parseInt(numericPart, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+
+  // Try objectID as last resort
+  if (result.objectID) {
+    const dashIdx = result.objectID.lastIndexOf('-');
+    const numericPart = dashIdx >= 0 ? result.objectID.slice(dashIdx + 1) : result.objectID;
+    const parsed = parseInt(numericPart, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+
+  return null;
+}
+
+/**
+ * Score a TVDB search result against the query title and year.
+ * Uses Levenshtein-based similarity with year bonus.
+ * Also tries with season suffixes stripped for better TV show matching.
+ */
+function scoreTVDBResult(
+  queryTitle: string,
+  queryYear: number | null,
+  result: TVDBSearchResult,
+): number {
+  const q = stripArticle(queryTitle.toLowerCase().trim());
+  const r = stripArticle((result.name ?? '').toLowerCase().trim());
+  let score = normalizedSimilarity(q, r);
+
+  // Also try with season suffixes stripped
+  const qStripped = stripArticle(extractSeriesName(queryTitle).toLowerCase().trim());
+  if (qStripped !== q) {
+    const strippedScore = normalizedSimilarity(qStripped, r);
+    score = Math.max(score, strippedScore);
+  }
+
+  // Year match bonus
+  if (queryYear && result.year) {
+    const resultYear = parseInt(result.year, 10);
+    if (resultYear === queryYear) {
+      score = Math.min(score + 0.1, 1);
+    }
+  }
+
+  return score;
+}
+
+/**
+ * Pick the best result from a TVDB search response using title similarity scoring.
+ * Returns the best match only if it meets a minimum similarity threshold.
+ */
+function pickBestResult(
+  title: string,
+  year: number | null,
+  results: TVDBSearchResult[],
+): TVDBSearchResult | null {
+  if (results.length === 0) return null;
+
+  let bestResult: TVDBSearchResult | null = null;
+  let bestScore = 0;
+
+  for (const result of results) {
+    const score = scoreTVDBResult(title, year, result);
+    log.debug(MODULE, 'TVDB candidate scored', {
+      queryTitle: title,
+      candidateName: result.name,
+      candidateYear: result.year ?? null,
+      score: Math.round(score * 1000) / 1000,
+      tvdbId: extractTVDBId(result),
+    });
+    if (score > bestScore) {
+      bestScore = score;
+      bestResult = result;
+    }
+  }
+
+  // Require a minimum similarity threshold (0.5) to avoid completely wrong matches
+  if (bestScore < 0.5) {
+    log.debug(MODULE, 'TVDB best result below similarity threshold', {
+      queryTitle: title,
+      bestName: bestResult?.name ?? null,
+      bestScore: Math.round(bestScore * 1000) / 1000,
+      threshold: 0.5,
+    });
+    return null;
+  }
+
+  return bestResult;
 }
 
 /**
@@ -117,7 +261,7 @@ export async function searchTVDBSeries(
     log.debug(MODULE, 'TVDB series search results', {
       query: title,
       resultCount: results.length,
-      results: results.map(r => ({ name: r.name, tvdbId: r.tvdb_id, year: r.year ?? null })),
+      results: results.map(r => ({ name: r.name, tvdbId: extractTVDBId(r), year: r.year ?? null })),
     });
 
     if (results.length === 0) {
@@ -125,26 +269,16 @@ export async function searchTVDBSeries(
       return null;
     }
 
-    // Try exact match first (case-insensitive)
-    const normalizedTitle = title.toLowerCase().trim();
-    const exactMatch = results.find(
-      r => r.name?.toLowerCase().trim() === normalizedTitle
-    );
-    if (exactMatch) {
-      const tvdbId = parseInt(exactMatch.tvdb_id, 10) || null;
-      log.debug(MODULE, 'TVDB series exact match found', {
-        query: title,
-        matchedName: exactMatch.name,
-        tvdbId,
-      });
-      return tvdbId;
+    const best = pickBestResult(title, year, results);
+    if (!best) {
+      log.debug(MODULE, 'No acceptable TVDB series match', { query: title });
+      return null;
     }
 
-    // Fall back to first result
-    const tvdbId = parseInt(results[0].tvdb_id, 10) || null;
-    log.debug(MODULE, 'TVDB series using first result (no exact match)', {
+    const tvdbId = extractTVDBId(best);
+    log.debug(MODULE, 'TVDB series best match', {
       query: title,
-      firstName: results[0].name,
+      matchedName: best.name,
       tvdbId,
     });
     return tvdbId;
@@ -192,7 +326,7 @@ export async function searchTVDBMovie(
     log.debug(MODULE, 'TVDB movie search results', {
       query: title,
       resultCount: results.length,
-      results: results.map(r => ({ name: r.name, tvdbId: r.tvdb_id, year: r.year ?? null })),
+      results: results.map(r => ({ name: r.name, tvdbId: extractTVDBId(r), year: r.year ?? null })),
     });
 
     if (results.length === 0) {
@@ -200,24 +334,16 @@ export async function searchTVDBMovie(
       return null;
     }
 
-    const normalizedTitle = title.toLowerCase().trim();
-    const exactMatch = results.find(
-      r => r.name?.toLowerCase().trim() === normalizedTitle
-    );
-    if (exactMatch) {
-      const tvdbId = parseInt(exactMatch.tvdb_id, 10) || null;
-      log.debug(MODULE, 'TVDB movie exact match found', {
-        query: title,
-        matchedName: exactMatch.name,
-        tvdbId,
-      });
-      return tvdbId;
+    const best = pickBestResult(title, year, results);
+    if (!best) {
+      log.debug(MODULE, 'No acceptable TVDB movie match', { query: title });
+      return null;
     }
 
-    const tvdbId = parseInt(results[0].tvdb_id, 10) || null;
-    log.debug(MODULE, 'TVDB movie using first result (no exact match)', {
+    const tvdbId = extractTVDBId(best);
+    log.debug(MODULE, 'TVDB movie best match', {
       query: title,
-      firstName: results[0].name,
+      matchedName: best.name,
       tvdbId,
     });
     return tvdbId;
@@ -231,8 +357,15 @@ export async function searchTVDBMovie(
 }
 
 /**
- * Look up a TVDB ID using an IMDB ID via the search/remoteid endpoint.
- * This is the most reliable way to cross-reference.
+ * Look up a TVDB ID using an IMDB ID.
+ *
+ * Uses two strategies:
+ *   1. The /search endpoint with `remote_id` query parameter (returns standard SearchResult).
+ *   2. Fallback to /search/remoteid/{imdbId} path endpoint (returns SearchByRemoteIdResult
+ *      with nested series/movie base records).
+ *
+ * This dual approach is needed because the TVDB v4 API has inconsistencies between the two
+ * endpoints and some entries are only findable through one or the other.
  */
 export async function findTVDBByImdbId(
   imdbId: string,
@@ -242,44 +375,122 @@ export async function findTVDBByImdbId(
 
     log.debug(MODULE, 'Looking up TVDB by IMDB ID', { imdbId });
 
-    const response = await fetch(
+    // Strategy 1: Use /search with remote_id query parameter
+    // This returns standard SearchResult objects which are more predictable
+    const searchParams = new URLSearchParams({
+      remote_id: imdbId,
+      limit: '5',
+    });
+    const searchResponse = await fetch(
+      `${TVDB_BASE_URL}/search?${searchParams.toString()}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (searchResponse.ok) {
+      const searchData = await searchResponse.json();
+      const searchResults: TVDBSearchResult[] = searchData?.data ?? [];
+
+      log.debug(MODULE, 'TVDB remote_id search results', {
+        imdbId,
+        resultCount: searchResults.length,
+        results: searchResults.map(r => ({
+          name: r.name,
+          type: r.type,
+          tvdbId: extractTVDBId(r),
+        })),
+      });
+
+      if (searchResults.length > 0) {
+        // Find the first result that is a series or movie
+        for (const result of searchResults) {
+          const resultType = (result.type ?? result.primary_type ?? '').toLowerCase();
+          const tvdbId = extractTVDBId(result);
+          if (tvdbId && (resultType === 'series' || resultType === 'movie')) {
+            const type = resultType === 'series' ? 'series' : 'movie';
+            log.info(MODULE, 'TVDB resolved IMDB ID via search remote_id', {
+              imdbId,
+              tvdbId,
+              type,
+              name: result.name,
+            });
+            return { tvdbId, type };
+          }
+        }
+        // If no series/movie type matched, use the first result with a valid ID
+        const first = searchResults[0];
+        const tvdbId = extractTVDBId(first);
+        if (tvdbId) {
+          const resultType = (first.type ?? first.primary_type ?? '').toLowerCase();
+          const type: 'series' | 'movie' = resultType === 'movie' ? 'movie' : 'series';
+          log.info(MODULE, 'TVDB resolved IMDB ID via search remote_id (first result)', {
+            imdbId,
+            tvdbId,
+            type,
+            name: first.name,
+          });
+          return { tvdbId, type };
+        }
+      }
+    } else {
+      log.debug(MODULE, 'TVDB /search with remote_id failed, trying path endpoint', {
+        imdbId,
+        status: searchResponse.status,
+      });
+    }
+
+    // Strategy 2: Fallback to /search/remoteid/{imdbId} path endpoint
+    // This returns SearchByRemoteIdResult with nested series/movie base records
+    log.debug(MODULE, 'Trying /search/remoteid path endpoint', { imdbId });
+
+    const remoteIdResponse = await fetch(
       `${TVDB_BASE_URL}/search/remoteid/${imdbId}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
-    if (!response.ok) {
-      log.warn(MODULE, 'TVDB remote ID lookup failed', { imdbId, status: response.status });
-      return null;
-    }
-    const data = await response.json();
-    const results = data?.data ?? [];
-
-    log.debug(MODULE, 'TVDB remote ID results', { imdbId, resultCount: results.length });
-
-    if (results.length === 0) {
-      log.debug(MODULE, 'No TVDB results for IMDB ID', { imdbId });
+    if (!remoteIdResponse.ok) {
+      log.warn(MODULE, 'TVDB remote ID path lookup also failed', { imdbId, status: remoteIdResponse.status });
       return null;
     }
 
-    // The remote ID search returns objects with nested series/movie records
-    for (const result of results) {
+    const remoteIdData = await remoteIdResponse.json();
+    const remoteIdResults = remoteIdData?.data ?? [];
+
+    log.debug(MODULE, 'TVDB remoteid path results', { imdbId, resultCount: remoteIdResults.length });
+
+    if (remoteIdResults.length === 0) {
+      log.debug(MODULE, 'No TVDB results for IMDB ID from either endpoint', { imdbId });
+      return null;
+    }
+
+    // The remote ID path endpoint returns objects with nested series/movie records
+    for (const result of remoteIdResults) {
       if (result.series) {
-        log.debug(MODULE, 'TVDB resolved IMDB ID to series', {
-          imdbId,
-          tvdbId: result.series.id,
-        });
-        return { tvdbId: result.series.id, type: 'series' };
+        const seriesId = typeof result.series.id === 'number'
+          ? result.series.id
+          : parseInt(String(result.series.id), 10);
+        if (!isNaN(seriesId) && seriesId > 0) {
+          log.debug(MODULE, 'TVDB resolved IMDB ID to series via path endpoint', {
+            imdbId,
+            tvdbId: seriesId,
+          });
+          return { tvdbId: seriesId, type: 'series' };
+        }
       }
       if (result.movie) {
-        log.debug(MODULE, 'TVDB resolved IMDB ID to movie', {
-          imdbId,
-          tvdbId: result.movie.id,
-        });
-        return { tvdbId: result.movie.id, type: 'movie' };
+        const movieId = typeof result.movie.id === 'number'
+          ? result.movie.id
+          : parseInt(String(result.movie.id), 10);
+        if (!isNaN(movieId) && movieId > 0) {
+          log.debug(MODULE, 'TVDB resolved IMDB ID to movie via path endpoint', {
+            imdbId,
+            tvdbId: movieId,
+          });
+          return { tvdbId: movieId, type: 'movie' };
+        }
       }
     }
 
-    log.debug(MODULE, 'TVDB remote ID results had no series/movie records', { imdbId });
+    log.debug(MODULE, 'TVDB remote ID results had no valid series/movie records', { imdbId });
     return null;
   } catch (err) {
     log.error(MODULE, 'TVDB remote ID lookup exception', {
@@ -329,10 +540,16 @@ export async function resolveTVDBId(
   }
 
   // Strategy 2: Title search as fallback
-  log.debug(MODULE, 'Trying title search (strategy 2)', { title, type, year });
+  // For TV shows, use the cleaned series name (without season suffixes)
+  const searchTitle = type === 'tv' ? extractSeriesName(title) : title;
+  log.debug(MODULE, 'Trying title search (strategy 2)', { title, searchTitle, type, year });
 
   if (type === 'tv') {
-    const tvdbId = await searchTVDBSeries(title, year);
+    let tvdbId = await searchTVDBSeries(searchTitle, year);
+    // If cleaned title failed, try original title
+    if (!tvdbId && searchTitle !== title) {
+      tvdbId = await searchTVDBSeries(title, year);
+    }
     if (tvdbId) {
       log.info(MODULE, 'TVDB ID resolved via series title search', { title, tvdbId });
     } else {

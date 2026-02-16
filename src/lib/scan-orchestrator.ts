@@ -7,7 +7,7 @@ import { images, scans, scanItems, usageRecords } from '@/lib/db/schema';
 import { callOpenRouter, calculateCost, isOpenRouterConfigured } from '@/lib/openrouter';
 import { SYSTEM_PROMPT, buildUserMessage } from '@/lib/prompts';
 import { SUPPORTED_MODELS, IMAGE_MAX_DIMENSION, IMAGE_JPEG_QUALITY, IMAGE_MAX_FILE_SIZE } from '@/lib/constants';
-import { enrichItems, isTMDBConfigured } from '@/lib/metadata';
+import { enrichItems, isTMDBConfigured, extractSeriesName } from '@/lib/metadata';
 import { isPlexConfigured, fetchAllPlexItems, matchWithPlex } from '@/lib/plex';
 import { log } from '@/lib/logger';
 import type { SSEWriter } from '@/lib/sse';
@@ -71,6 +71,159 @@ function coerceItemTypes(data: unknown): unknown {
     });
   }
   return obj;
+}
+
+/**
+ * Deduplicate LLM items that are repeated seasons of the same series.
+ * If the LLM hallucinates "Show - Season 1", "Show - Season 2", ..., "Show - Season N",
+ * collapse them into a single entry using the base series name.
+ * Only collapses when 3+ sequential seasons of the same series are detected.
+ */
+function deduplicateSeasons(items: LLMIdentifiedItem[]): LLMIdentifiedItem[] {
+  // Group items by their base series name
+  const seriesGroups = new Map<string, LLMIdentifiedItem[]>();
+
+  for (const item of items) {
+    if (item.type !== 'tv') {
+      continue;
+    }
+    const baseName = extractSeriesName(item.title).toLowerCase().trim();
+    if (baseName !== item.title.toLowerCase().trim()) {
+      // This item had a season suffix that was stripped
+      const group = seriesGroups.get(baseName) ?? [];
+      group.push(item);
+      seriesGroups.set(baseName, group);
+    }
+  }
+
+  // Build a set of items to collapse
+  const itemsToRemove = new Set<LLMIdentifiedItem>();
+  const replacements: LLMIdentifiedItem[] = [];
+
+  for (const [, group] of seriesGroups) {
+    if (group.length < 3) continue; // Only collapse 3+ season entries
+
+    log.warn(MODULE, 'Collapsing hallucinated season entries', {
+      baseName: extractSeriesName(group[0].title),
+      seasonCount: group.length,
+      titles: group.slice(0, 5).map(i => i.title),
+    });
+
+    // Mark all season entries for removal
+    for (const item of group) {
+      itemsToRemove.add(item);
+    }
+
+    // Create a single replacement entry using the base series name
+    replacements.push({
+      title: extractSeriesName(group[0].title),
+      creator: group[0].creator,
+      type: 'tv',
+      year: group[0].year,
+    });
+  }
+
+  if (itemsToRemove.size === 0) return items;
+
+  // Rebuild the items list: keep non-removed items, insert replacements
+  // at the position of the first removed item in each group
+  const result: LLMIdentifiedItem[] = [];
+  let replacementIdx = 0;
+  let lastInsertedGroup: string | null = null;
+
+  for (const item of items) {
+    if (itemsToRemove.has(item)) {
+      const baseName = extractSeriesName(item.title).toLowerCase().trim();
+      if (baseName !== lastInsertedGroup && replacementIdx < replacements.length) {
+        result.push(replacements[replacementIdx++]);
+        lastInsertedGroup = baseName;
+      }
+      // Skip duplicate season entries
+    } else {
+      result.push(item);
+    }
+  }
+
+  log.info(MODULE, 'Season deduplication complete', {
+    originalCount: items.length,
+    deduplicatedCount: result.length,
+    collapsedGroups: replacements.length,
+  });
+
+  return result;
+}
+
+/**
+ * Attempt to salvage items from a truncated JSON response.
+ * The LLM may have been cut off mid-JSON, but the items up to
+ * the truncation point may still be valid.
+ */
+function salvageTruncatedJson(content: string): LLMIdentifiedItem[] | null {
+  // Try to find the items array and close it properly
+  // Look for the last complete item object (ends with "}")
+  const itemsMatch = content.match(/"items"\s*:\s*\[/);
+  if (!itemsMatch) return null;
+
+  // Find all complete item objects
+  const itemsStart = content.indexOf('[', content.indexOf('"items"'));
+  if (itemsStart < 0) return null;
+
+  const afterBracket = content.slice(itemsStart);
+
+  // Try progressively shorter substrings to find parseable JSON
+  // Look for the last complete "}" that closes an item
+  let lastGoodPos = -1;
+  let braceDepth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = 1; i < afterBracket.length; i++) {
+    const ch = afterBracket[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{') braceDepth++;
+    if (ch === '}') {
+      braceDepth--;
+      if (braceDepth === 0) {
+        lastGoodPos = i;
+      }
+    }
+  }
+
+  if (lastGoodPos < 0) return null;
+
+  // Construct valid JSON with the items array closed properly
+  const validArrayContent = afterBracket.slice(0, lastGoodPos + 1);
+  const reconstructed = `{"items": ${validArrayContent}]}`;
+
+  try {
+    const parsed = JSON.parse(reconstructed);
+    const coerced = coerceItemTypes(parsed);
+    const validated = LLMResponseSchema.safeParse(coerced);
+    if (validated.success && validated.data.items.length > 0) {
+      log.info(MODULE, 'Salvaged items from truncated response', {
+        salvaged: validated.data.items.length,
+      });
+      return validated.data.items;
+    }
+  } catch {
+    // Salvage attempt failed
+  }
+
+  return null;
 }
 
 async function hashBuffer(buffer: Buffer): Promise<string> {
@@ -184,13 +337,44 @@ export async function runFullScan({ imageBuffer, mimeType, modelId, writer }: Ru
       const response = await callOpenRouter({
         model: model.id,
         messages,
-        max_tokens: 4096,
+        max_tokens: 16384,
         temperature: 0.1,
       });
 
       const content = response.choices[0]?.message?.content;
       if (!content) {
         lastError = 'LLM returned empty response';
+        continue;
+      }
+
+      // Detect truncated responses — if the model hit the token limit,
+      // the JSON will be incomplete and unparseable.
+      const finishReason = response.choices[0]?.finish_reason;
+      if (finishReason === 'length') {
+        log.warn(MODULE, 'LLM response truncated (hit max_tokens limit)', {
+          model: model.id,
+          completionTokens: response.usage.completion_tokens,
+          contentLength: content.length,
+          contentTail: content.slice(-100),
+        });
+
+        // Try to salvage complete items from the truncated response
+        const salvaged = salvageTruncatedJson(content);
+        if (salvaged && salvaged.length > 0) {
+          log.info(MODULE, 'Using salvaged items from truncated response', {
+            count: salvaged.length,
+          });
+          rawResponseContent = content;
+          usageData = {
+            inputTokens: response.usage.prompt_tokens,
+            outputTokens: response.usage.completion_tokens,
+            model: response.model || model.id,
+          };
+          llmItems = salvaged;
+          break;
+        }
+
+        lastError = 'LLM response was truncated (too many items for token limit). Try scanning fewer items at once.';
         continue;
       }
 
@@ -341,6 +525,9 @@ async function enrichAndSaveItems(
   writer?: SSEWriter,
 ) {
   const db = getDb();
+
+  // Collapse hallucinated season sequences before enrichment
+  llmItems = deduplicateSeasons(llmItems);
 
   updateScanStatus(scanId, 'enriching', writer);
 
