@@ -54,15 +54,82 @@ function stripArticle(s: string): string {
   return s.replace(/^(the|a|an)\s+/i, '').trim();
 }
 
+/**
+ * Strip season/series suffixes that the LLM commonly appends to TV show titles.
+ * TMDB returns just the series name (e.g. "CSI: Crime Scene Investigation")
+ * but the LLM often returns "CSI: Crime Scene Investigation - Season 1".
+ *
+ * This handles patterns like:
+ *   - "Show - Season 1", "Show: Season 1", "Show Season 1"
+ *   - "Show - S01", "Show S01"
+ *   - "Show - The Complete First Season", "Show - Complete Season 3"
+ *   - "Show - The Complete Series", "Show: Complete Series"
+ *   - "Show - Series 1", "Show: Series 1"
+ *   - "Show (Season 1)", "Show (2005) - Season 1"
+ */
+function stripSeasonSuffix(s: string): string {
+  // Remove trailing parenthetical season info: "Show (Season 1)" -> "Show"
+  let cleaned = s.replace(/\s*\((?:season|series|s)\s*\d+\)\s*$/i, '');
+
+  // Remove "- Season 1", ": Season 1", "Season 1" at end (with optional ordinals like "First", "Second")
+  cleaned = cleaned.replace(
+    /\s*[-:]\s*(?:the\s+)?(?:complete\s+)?(?:season|series)\s+(?:\d+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s*$/i,
+    ''
+  );
+
+  // Remove standalone "Season X" at end (no separator)
+  cleaned = cleaned.replace(
+    /\s+(?:the\s+)?(?:complete\s+)?(?:season|series)\s+(?:\d+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s*$/i,
+    ''
+  );
+
+  // Remove "- S01", "S01" at end
+  cleaned = cleaned.replace(/\s*[-:]\s*s\d+\s*$/i, '');
+
+  // Remove "- The Complete Series", ": Complete Series"
+  cleaned = cleaned.replace(/\s*[-:]\s*(?:the\s+)?complete\s+series\s*$/i, '');
+
+  // Remove "- Complete Season", ": The Complete Nth Season"
+  cleaned = cleaned.replace(
+    /\s*[-:]\s*(?:the\s+)?complete\s+(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th)?)\s+season\s*$/i,
+    ''
+  );
+
+  return cleaned.trim();
+}
+
+/**
+ * Extract the base series name from a title for TMDB search purposes.
+ * Applies season stripping and also handles year suffixes in parentheses.
+ */
+export function extractSeriesName(title: string): string {
+  let name = stripSeasonSuffix(title);
+  // Remove trailing year in parentheses: "Show (2005)" -> "Show"
+  name = name.replace(/\s*\(\d{4}\)\s*$/, '');
+  return name.trim();
+}
+
 function computeTitleScore(queryTitle: string, resultTitle: string): number {
   const t1 = stripArticle(queryTitle.toLowerCase());
   const t2 = stripArticle(resultTitle.toLowerCase());
-  const score = normalizedSimilarity(t1, t2);
+  const rawScore = normalizedSimilarity(t1, t2);
+
+  // Also compute score with season suffixes stripped from the query,
+  // since TMDB returns just the series name without season info
+  const t1Stripped = stripArticle(stripSeasonSuffix(queryTitle).toLowerCase());
+  const strippedScore = normalizedSimilarity(t1Stripped, t2);
+
+  // Use the better of the two scores
+  const score = Math.max(rawScore, strippedScore);
+
   log.debug(MODULE, 'Title score computed', {
     query: queryTitle,
     result: resultTitle,
     normalizedQuery: t1,
     normalizedResult: t2,
+    rawScore: Math.round(rawScore * 1000) / 1000,
+    strippedQuery: t1Stripped !== t1 ? t1Stripped : undefined,
+    strippedScore: t1Stripped !== t1 ? Math.round(strippedScore * 1000) / 1000 : undefined,
     score: Math.round(score * 1000) / 1000,
   });
   return score;
@@ -518,7 +585,37 @@ async function enrichMovie(item: LLMIdentifiedItem, apiKey: string): Promise<Enr
 async function enrichTV(item: LLMIdentifiedItem, apiKey: string): Promise<EnrichedItem> {
   log.info(MODULE, 'Enriching TV show', { title: item.title, year: item.year ?? null, creator: item.creator });
 
-  const results = await searchTMDBTV(item.title, item.year, apiKey);
+  // Extract the base series name (without season suffixes) for better TMDB matching.
+  // The LLM often returns "Show - Season 1" but TMDB indexes by series name only.
+  const seriesName = extractSeriesName(item.title);
+  const searchTitle = seriesName !== item.title ? seriesName : item.title;
+
+  log.debug(MODULE, 'TV search title', {
+    originalTitle: item.title,
+    searchTitle,
+    wasStripped: seriesName !== item.title,
+  });
+
+  let results = await searchTMDBTV(searchTitle, item.year, apiKey);
+
+  // If the cleaned title returned no results, try the original title as fallback
+  if (results.length === 0 && searchTitle !== item.title) {
+    log.debug(MODULE, 'No results with cleaned title, retrying with original', {
+      cleanedTitle: searchTitle,
+      originalTitle: item.title,
+    });
+    results = await searchTMDBTV(item.title, item.year, apiKey);
+  }
+
+  // If still no results and we have a year filter, try without it
+  if (results.length === 0 && item.year && item.year > 0) {
+    log.debug(MODULE, 'No results with year filter, retrying without year', {
+      title: searchTitle,
+      year: item.year,
+    });
+    results = await searchTMDBTV(searchTitle, undefined, apiKey);
+  }
+
   if (results.length === 0) {
     log.warn(MODULE, 'No TMDB TV results found', { title: item.title, year: item.year ?? null });
     return buildUnmatched(item);
